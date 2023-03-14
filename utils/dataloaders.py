@@ -427,7 +427,7 @@ class LoadStreams:
 
 def img2label_paths(img_paths):
     # Define label paths as a function of image paths
-    sa, sb = f'{os.sep}images{os.sep}', f'{os.sep}labels{os.sep}'  # /images/, /labels/ substrings
+    sa, sb = f'{os.sep}images{os.sep}', f'{os.sep}clean_labels{os.sep}'  # /images/, /labels/ substrings
 
     if 'yifeiliu' in list(img_paths)[0]:
         old_dataset_root = '/data1/yifeiliu/ContentDetection/Website_Screenshots_Dataset'
