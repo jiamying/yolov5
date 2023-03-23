@@ -247,15 +247,19 @@ class Focus(nn.Module):
 
 class GhostConv(nn.Module):
     # Ghost Convolution https://github.com/huawei-noah/ghostnet
-    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):  # ch_in, ch_out, kernel, stride, groups
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True, ratio=2, dw_size=3):  # ch_in, ch_out, kernel, stride, groups
         super().__init__()
-        c_ = c2 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, k, s, None, g, act=act)
-        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act=act)
+        self.c2 = c2
+        self.init_channels = math.ceil(c2 / ratio)
+        self.new_channels = self.init_channels * (ratio - 1)
+        self.cv1 = Conv(c1, self.init_channels, k, s, None, g, act=act)
+        self.cv2 = Conv(self.init_channels, self.new_channels, 3, 1, None, self.new_channels, act=act)
 
     def forward(self, x):
-        y = self.cv1(x)
-        return torch.cat((y, self.cv2(y)), 1)
+        x1 = self.cv1(x)
+        x2 = self.cv2(x1)
+        out = torch.cat([x1,x2], dim=1)
+        return out[:,:self.c2,:,:]
 
 
 class GhostBottleneck(nn.Module):
