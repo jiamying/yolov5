@@ -1115,6 +1115,187 @@ def increment_path(path, exist_ok=False, sep='', mkdir=False):
     return path
 
 
+def is_overlapped_vertically(box_a, box_b, min_y_overlap_ratio=0.8):
+    """Check if two boxes are on the same line by their y-axis coordinates.
+
+    Two boxes are on the same line if they overlap vertically, and the length
+    of the overlapping line segment is greater than min_y_overlap_ratio * the
+    height of either of the boxes.
+
+    Args:
+        box_a (list), box_b (list): Two bounding boxes to be checked (xyxy)
+        min_y_overlap_ratio (float): The minimum vertical overlapping ratio
+                                    allowed for boxes in the same line
+
+    Returns:
+        The bool flag indicating if they are on the same line
+    """
+    a_y_min = box_a[1]
+    b_y_min = box_b[1]
+    a_y_max = box_a[3]
+    b_y_max = box_b[3]
+
+    # Make sure that box a is always the box above another
+    if a_y_min > b_y_min:
+        a_y_min, b_y_min = b_y_min, a_y_min
+        a_y_max, b_y_max = b_y_max, a_y_max
+
+    if b_y_min <= a_y_max:
+        if min_y_overlap_ratio is not None:
+            sorted_y = sorted([b_y_min, b_y_max, a_y_max])
+            overlap = sorted_y[1] - sorted_y[0]
+            min_a_overlap = (a_y_max - a_y_min) * min_y_overlap_ratio
+            min_b_overlap = (b_y_max - b_y_min) * min_y_overlap_ratio
+            return overlap >= min_a_overlap or overlap >= min_b_overlap
+        else:
+            return True
+    return False
+
+
+def is_overlapped_horizontally(box_a, box_b, min_x_overlap_ratio=0.9):
+    a_x_min = box_a[0]
+    b_x_min = box_b[0]
+    a_x_max = box_a[2]
+    b_x_max = box_b[2]
+
+    # Make sure that box a is always the box on the left
+    if a_x_min > b_x_min:
+        a_x_min, b_x_min = b_x_min, a_x_min
+        a_x_max, b_x_max = b_x_max, a_x_max
+
+    if b_x_min <= a_x_max:
+        if min_x_overlap_ratio is not None:
+            sorted_x = sorted([b_x_min, b_x_max, a_x_max])
+            overlap = sorted_x[1] - sorted_x[0]
+            min_a_overlap = (a_x_max - a_x_min) * min_x_overlap_ratio
+            min_b_overlap = (b_x_max - b_x_min) * min_x_overlap_ratio
+            return overlap >= min_a_overlap or overlap >= min_b_overlap
+        else:
+            return True
+    return False
+
+
+def which_is_contained(box_a, box_b):
+    if is_overlapped_vertically(box_a, box_b) and is_overlapped_horizontally(box_a, box_b):
+        area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+        area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+        if area_a < area_b:
+            return 0
+        else:
+            return 1
+    return -1
+
+
+def drop_contained_boxes(boxes):
+    drop_indices = set()
+    for i in range(len(boxes)-1):
+        for j in range(i+1, len(boxes)):
+            if boxes[i][5] == boxes[j][5]:
+                contained_box = which_is_contained(boxes[i], boxes[j])
+                if contained_box == 0:
+                    drop_indices.add(i)
+                elif contained_box == 1:
+                    drop_indices.add(j)
+
+    all_indices = set([i for i in range(boxes.shape[0])])
+    keep_indices = torch.tensor(list(all_indices - drop_indices), device=boxes.device)
+    return torch.index_select(boxes, dim=0, index=keep_indices)
+
+
+def stitch_boxes_into_lines(boxes, class_id, max_x_dist=0.01, min_y_overlap_ratio=0.8):
+    """Stitch fragmented boxes of words into lines.
+
+    Note: part of its logic is inspired by @Johndirr
+    (https://github.com/faustomorales/keras-ocr/issues/22)
+
+    Args:
+        boxes (list): List of ocr results to be stitched
+        max_x_dist (int): The maximum horizontal distance between the closest
+                    edges of neighboring boxes in the same line
+        min_y_overlap_ratio (float): The minimum vertical overlapping ratio
+                    allowed for any pairs of neighboring boxes in the same line
+
+    Returns:
+        merged_boxes(list[dict]): List of merged boxes and texts
+    """
+
+    if len(boxes) <= 1:
+        return boxes
+
+    boxes_ = boxes.cpu().numpy()
+
+    this_class_indices = boxes_[:, 5] == class_id
+    other_classed_indices = np.logical_not(this_class_indices)
+    this_class = boxes_[this_class_indices].tolist()
+    other_classes = boxes_[other_classed_indices].tolist()
+
+    merged_boxes = []
+
+    # sort groups based on the x_min coordinate of boxes
+    x_sorted_boxes = sorted(this_class, key=lambda x: x[0])
+    # store indexes of boxes which are already parts of other lines
+    skip_idxs = set()
+
+    i = 0
+    # locate lines of boxes starting from the leftmost one
+    for i in range(len(x_sorted_boxes)):
+        if i in skip_idxs:
+            continue
+        # the rightmost box in the current line
+        rightmost_box_idx = i
+        line = [rightmost_box_idx]
+        for j in range(i + 1, len(x_sorted_boxes)):
+            if j in skip_idxs:
+                continue
+            if is_overlapped_vertically(x_sorted_boxes[rightmost_box_idx],
+                                        x_sorted_boxes[j], min_y_overlap_ratio):
+                line.append(j)
+                skip_idxs.add(j)
+                rightmost_box_idx = j
+
+        # split line into lines if the distance between two neighboring
+        # sub-lines' is greater than max_x_dist
+        lines = []
+        line_idx = 0
+        lines.append([line[0]])
+        rightmost = x_sorted_boxes[line[0]][2]
+        for k in range(1, len(line)):
+            curr_box = x_sorted_boxes[line[k]]
+            dist = curr_box[0] - rightmost
+            if dist > max_x_dist:
+                line_idx += 1
+                lines.append([])
+            lines[line_idx].append(line[k])
+            rightmost = max(rightmost, curr_box[2])
+
+        # Get merged boxes
+        for box_group in lines:
+            x_min, y_min = float('inf'), float('inf')
+            x_max, y_max = float('-inf'), float('-inf')
+            avg_conf = 0.
+            for idx in box_group:
+                x_max = max(x_sorted_boxes[idx][2], x_max)
+                x_min = min(x_sorted_boxes[idx][0], x_min)
+                y_max = max(x_sorted_boxes[idx][3], y_max)
+                y_min = min(x_sorted_boxes[idx][1], y_min)
+                avg_conf += x_sorted_boxes[idx][4]
+            avg_conf / len(box_group)
+            merged_box = [
+                x_min, y_min, x_max, y_max, avg_conf, class_id
+            ]
+            merged_boxes.append(merged_box)
+
+    return torch.tensor(merged_boxes + other_classes, device=boxes.device)
+
+
+def remove_redundant(prediction, max_x_dist=0.01, min_y_overlap_ratio=0.8, min_x_overlap_ratio=0.9):
+    output = []
+    for x in prediction:
+        y = stitch_boxes_into_lines(x, class_id=0, max_x_dist=max_x_dist, min_y_overlap_ratio=min_y_overlap_ratio)
+        output.append(y)
+    return output
+
+
 # OpenCV Multilanguage-friendly functions ------------------------------------------------------------------------------------
 imshow_ = cv2.imshow  # copy to avoid recursion errors
 
