@@ -542,10 +542,11 @@ class DetectMultiBackend(nn.Module):
             self.context.execute_v2(list(self.binding_addrs.values()))
             y = [self.bindings[x].data for x in sorted(self.output_names)]
         elif self.coreml:  # CoreML
+            im = torch.permute(im, (0, 3, 1, 2))
             im = im.cpu().numpy()
-            im = Image.fromarray((im[0] * 255).astype('uint8'))
+            # im = Image.fromarray((im[0] * 255).astype('uint8'))
             # im = im.resize((192, 320), Image.ANTIALIAS)
-            y = self.model.predict({'image': im})  # coordinates are xywh normalized
+            y = self.model.predict({'input': im})  # coordinates are xywh normalized
             if 'confidence' in y:
                 box = xywh2xyxy(y['coordinates'] * [[w, h, w, h]])  # xyxy pixels
                 conf, cls = y['confidence'].max(1), y['confidence'].argmax(1).astype(np.float)
