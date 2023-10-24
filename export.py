@@ -232,7 +232,7 @@ def export_coreml(model, im, file, int8, half, prefix=colorstr('CoreML:')):
     f = file.with_suffix('.mlmodel')
 
     ts = torch.jit.trace(model, im, strict=False)  # TorchScript model
-    ct_model = ct.convert(ts, inputs=[ct.ImageType('image', shape=im.shape, scale=1 / 255, bias=[0, 0, 0])])
+    ct_model = ct.convert(ts, inputs=[ct.TensorType(shape=im.shape, name='input')])
     bits, mode = (8, 'kmeans_lut') if int8 else (16, 'linear') if half else (32, None)
     if bits < 32:
         if MACOS:  # quantization only supported on macOS
