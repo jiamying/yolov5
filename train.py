@@ -34,6 +34,9 @@ import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 
+import coremltools as ct
+from coremltools.optimize.torch.pruning import MagnitudePruner, MagnitudePrunerConfig, PolynomialDecayScheduler
+
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
@@ -167,6 +170,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     else:
         lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+
+    # Pruner
+    pruning_scheduler = PolynomialDecayScheduler(update_steps=list(range(4000, 20000, 100)))  # TODO
+    conv_config = ModuleMagnitudePrunerConfig(target_sparsity=0.75)
+    pruner_config = MagnitudePrunerConfig().set_module_type(torch.nn.Conv2d, conv_config)
+    pruner = MagnitudePruner(model, pruner_config)
+    # insert pruning layers in the model
+    model = pruner.prepare(inplace=True)
 
     # EMA
     ema = ModelEMA(model) if RANK in {-1, 0} else None
@@ -352,6 +363,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
 
+        # Pruner step
+        pruner.step()
+
         if RANK in {-1, 0}:
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
@@ -380,6 +394,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
             # Save model
+            pruner.finalize(inplace=False)
             if (not nosave) or (final_epoch and not evolve):  # if save
                 ckpt = {
                     'epoch': epoch,
