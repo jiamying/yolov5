@@ -35,7 +35,7 @@ from torch.optim import lr_scheduler
 from tqdm import tqdm
 
 import coremltools as ct
-from coremltools.optimize.torch.pruning import MagnitudePruner, MagnitudePrunerConfig, PolynomialDecayScheduler
+from coremltools.optimize.torch.pruning import MagnitudePruner, MagnitudePrunerConfig, ModuleMagnitudePrunerConfig, PolynomialDecayScheduler
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -80,6 +80,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     w = save_dir / 'weights'  # weights dir
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
     last, best = w / 'last.pt', w / 'best.pt'
+    best_coreml = w / 'best_coreml.mlpackage'
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -173,7 +174,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     # Pruner
     pruning_scheduler = PolynomialDecayScheduler(update_steps=list(range(4000, 20000, 100)))  # TODO
-    conv_config = ModuleMagnitudePrunerConfig(target_sparsity=0.75)
+    conv_config = ModuleMagnitudePrunerConfig(scheduler=pruning_scheduler, target_sparsity=0.75)
     pruner_config = MagnitudePrunerConfig().set_module_type(torch.nn.Conv2d, conv_config)
     pruner = MagnitudePruner(model, pruner_config)
     # insert pruning layers in the model
@@ -393,6 +394,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             log_vals = list(mloss) + list(results) + lr
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
+            # Report pruning state
+            print(pruner.report())
+
             # Save model
             pruner.finalize(inplace=False)
             if (not nosave) or (final_epoch and not evolve):  # if save
@@ -411,6 +415,16 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
+                    im = torch.zeros(1, 3, img_height, imgsz).to('cuda:1')
+                    model_export = deepcopy(de_parallel(model)).to('cuda:1')
+                    model_export.eval()
+                    ts = torch.jit.trace(model_export, im, strict=False, check_trace=False)
+                    ct_model = ct.convert(
+                        ts,
+                        inputs=[ct.TensorType(shape=im.shape, name='input')],
+                        pass_pipeline=ct.PassPipeline.DEFAULT_PRUNING,
+                        minimum_deployment_target=ct.target.macOS13)
+                    ct_model.save(best_coreml)
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
                 del ckpt
@@ -429,30 +443,28 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # end training -----------------------------------------------------------------------------------------------------
     if RANK in {-1, 0}:
         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
-        for f in last, best:
-            if f.exists():
-                strip_optimizer(f)  # strip optimizers
-                if f is best:
-                    LOGGER.info(f'\nValidating {f}...')
-                    results, _, _ = validate.run(
-                        data_dict,
-                        batch_size=batch_size // WORLD_SIZE * 2,
-                        imgsz=imgsz,
-                        model=attempt_load(f, device).half(),
-                        iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
-                        single_cls=single_cls,
-                        dataloader=val_loader,
-                        save_dir=save_dir,
-                        save_json=is_coco,
-                        verbose=True,
-                        plots=plots,
-                        callbacks=callbacks,
-                        compute_loss=compute_loss,
-                        img_height=img_height)  # val best model with plots
-                    if is_coco:
-                        callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
+        # model = ct.models.MLModel(best_coreml)
 
-        callbacks.run('on_train_end', last, best, epoch, results)
+        # LOGGER.info(f'\nValidating {f}...')
+        # results, _, _ = validate.run(
+        #     data_dict,
+        #     batch_size=batch_size // WORLD_SIZE * 2,
+        #     imgsz=imgsz,
+        #     model=model.half(),
+        #     iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
+        #     single_cls=single_cls,
+        #     dataloader=val_loader,
+        #     save_dir=save_dir,
+        #     save_json=is_coco,
+        #     verbose=True,
+        #     plots=plots,
+        #     callbacks=callbacks,
+        #     compute_loss=compute_loss,
+        #     img_height=img_height)  # val best model with plots
+        # if is_coco:
+        #     callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
+
+        # callbacks.run('on_train_end', last, best, epoch, results)
 
     torch.cuda.empty_cache()
     return results
