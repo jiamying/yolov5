@@ -45,7 +45,7 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 import val as validate  # for end-of-epoch mAP
 from models.experimental import attempt_load
-from models.yolo import Model
+from models.yolo import Model, Detect
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
@@ -81,6 +81,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
     last, best = w / 'last.pt', w / 'best.pt'
     best_coreml = w / 'best_coreml.mlpackage'
+    best_ts = w / 'best_ts.pt'
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -176,6 +177,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     pruning_scheduler = PolynomialDecayScheduler(update_steps=list(range(4000, 20000, 100)))  # TODO
     conv_config = ModuleMagnitudePrunerConfig(scheduler=pruning_scheduler, target_sparsity=0.75)
     pruner_config = MagnitudePrunerConfig().set_module_type(torch.nn.Conv2d, conv_config)
+    print('pruner config: ', pruner_config.as_dict())
     pruner = MagnitudePruner(model, pruner_config)
     # insert pruning layers in the model
     model = pruner.prepare(inplace=True)
@@ -349,6 +351,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     ema.update(model)
                 last_opt_step = ni
 
+            # Pruner step
+            pruner.step()
+
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
@@ -363,9 +368,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
-
-        # Pruner step
-        pruner.step()
 
         if RANK in {-1, 0}:
             # mAP
@@ -398,7 +400,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             print(pruner.report())
 
             # Save model
-            pruner.finalize(inplace=False)
             if (not nosave) or (final_epoch and not evolve):  # if save
                 ckpt = {
                     'epoch': epoch,
@@ -415,16 +416,29 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
+
+                    # prune model
+                    pruned_model = de_parallel(pruner.finalize(inplace=False)).to('cuda:1')
+                    pruned_model.eval()
+                    for k, m in pruned_model.named_modules():
+                        if isinstance(m, Detect):
+                            m.export = True
+
                     im = torch.zeros(1, 3, img_height, imgsz).to('cuda:1')
-                    model_export = deepcopy(de_parallel(model)).to('cuda:1')
-                    model_export.eval()
-                    ts = torch.jit.trace(model_export, im, strict=False, check_trace=False)
+                    for _ in range(2):
+                        y = pruned_model(im)  # dry runs
+
+                    # export ts and coreml
+                    ts = torch.jit.trace(pruned_model, im, strict=False, check_trace=True)
+                    ts.save(best_ts)
                     ct_model = ct.convert(
                         ts,
                         inputs=[ct.TensorType(shape=im.shape, name='input')],
+                        compute_precision=ct.precision.FLOAT32,
                         pass_pipeline=ct.PassPipeline.DEFAULT_PRUNING,
                         minimum_deployment_target=ct.target.macOS13)
                     ct_model.save(best_coreml)
+                    del pruned_model
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
                 del ckpt
