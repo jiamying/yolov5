@@ -175,7 +175,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     # Pruner
     pruning_scheduler = PolynomialDecayScheduler(update_steps=list(range(4000, 20000, 100)))  # TODO
-    conv_config = ModuleMagnitudePrunerConfig(scheduler=pruning_scheduler, target_sparsity=0.75)
+    conv_config = ModuleMagnitudePrunerConfig(granularity='per_kernel', scheduler=pruning_scheduler, target_sparsity=0.6)
     pruner_config = MagnitudePrunerConfig().set_module_type(torch.nn.Conv2d, conv_config)
     print('pruner config: ', pruner_config.as_dict())
     pruner = MagnitudePruner(model, pruner_config)
